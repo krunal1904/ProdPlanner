@@ -189,6 +189,26 @@ def get_workorder_list(company, warehouses, docname=None, filters=None):
             produced = float(wo.produced_qty or 0)
             balance_quantity = max(0, planned - produced)
 
+            # -------------------------------
+            # OPERATION COMPLETION CHECK
+            # -------------------------------
+            operations = frappe.get_all(
+                "Work Order Operation",
+                filters={"parent": wo.name},
+                fields=["status"]
+            )
+
+            operations_completed = None  # default skip
+
+            if operations:
+                operations_completed = False
+                for op in operations:
+                    if op.status == "Completed":
+                        operations_completed = True
+                    else:
+                        operations_completed = False
+                        break
+
             # Append child row to Bulk Production Page
             parent.append("work_order_list", {
                 "work_order_id": wo.name,
@@ -200,7 +220,8 @@ def get_workorder_list(company, warehouses, docname=None, filters=None):
                 "planned_quantity": wo.qty,
                 "quantity_produced": wo.produced_qty,
                 "inventory_check": status,
-                "operations_included": frappe.db.count("Work Order Operation", {"parent": wo.name}) > 0
+                "operations_included": frappe.db.count("Work Order Operation", {"parent": wo.name}) > 0,
+                "operations_completed": operations_completed
             })
 
         parent.save(ignore_permissions=True)
@@ -428,174 +449,401 @@ def refresh_material_status(work_orders):
 #         frappe.msgprint = original_msgprint
 
 
+# @frappe.whitelist()
+# def wo_validations(wo_ids, include_operations=0):
+
+#     if isinstance(wo_ids, str):
+#         wo_ids = json.loads(wo_ids)
+
+#     success_rows = []
+#     error_rows = []
+#     updated_rows = []
+
+#     # Silence msgprint
+#     original_msgprint = frappe.msgprint
+#     frappe.msgprint = lambda *args, **kwargs: None
+
+#     # ------------------- LOAD SINGLE DOCTYPE -------------------
+#     bulk_ops_doc = frappe.get_single("Bulk Production Operation")
+
+#     # ------------------- DUPLICATE GUARD -------------------
+#     existing_ops = set()
+#     for r in bulk_ops_doc.work_order_list or []:
+#         existing_ops.add((r.work_order_id, r.operation))
+
+#     # ------------------- BUFFER FOR NEW ROWS (TOP INSERT) -------------------
+#     new_rows = []
+
+#     try:
+#         for row in wo_ids:
+#             wo = row.get("work_order_id")
+#             sales_order = row.get("sales_order")
+#             production_plan = row.get("production_plan")
+
+#             if not wo:
+#                 continue
+
+#             try:
+#                 doc = frappe.get_doc("Work Order", wo)
+#                 changes_made = False
+
+#                 # ------------------- SETTINGS -------------------
+#                 include_operations = frappe.db.get_single_value(
+#                     "Bulk Production Settings", "include_operations"
+#                 )
+
+#                 if include_operations == 0 and doc.operations:
+#                     doc.operations = []
+#                     changes_made = True
+
+#                 # ------------------- OPERATION DEFAULTS -------------------
+#                 if include_operations == 1:
+#                     for op in doc.operations or []:
+#                         if not op.time_in_mins:
+#                             default_time = frappe.db.get_value(
+#                                 "Operation", op.operation, "custom_default_time"
+#                             )
+#                             if default_time:
+#                                 op.time_in_mins = default_time
+#                                 changes_made = True
+
+#                         if not op.workstation:
+#                             default_ws = frappe.db.get_value(
+#                                 "Operation", op.operation, "workstation"
+#                             )
+#                             if default_ws:
+#                                 op.workstation = default_ws
+#                                 changes_made = True
+
+#                 # ------------------- FG WAREHOUSE -------------------
+#                 if doc.production_item:
+#                     item_group = frappe.db.get_value(
+#                         "Item", doc.production_item, "item_group"
+#                     )
+#                     ig_doc = frappe.get_doc("Item Group", item_group)
+
+#                     if not ig_doc.item_group_defaults:
+#                         error_rows.append({
+#                             "work_order_id": wo,
+#                             "error": f"No Default Warehouse in Item Group {item_group}"
+#                         })
+#                         continue
+
+#                     fg_wh = ig_doc.item_group_defaults[0].default_warehouse
+#                     if not fg_wh:
+#                         error_rows.append({
+#                             "work_order_id": wo,
+#                             "error": f"FG Warehouse missing in Item Group {item_group}"
+#                         })
+#                         continue
+
+#                     if doc.fg_warehouse != fg_wh:
+#                         doc.fg_warehouse = fg_wh
+#                         changes_made = True
+
+#                 # ------------------- REQUIRED ITEMS -------------------
+#                 for ri in doc.required_items or []:
+#                     rig = frappe.db.get_value("Item", ri.item_code, "item_group")
+#                     rig_doc = frappe.get_doc("Item Group", rig)
+
+#                     if not rig_doc.item_group_defaults:
+#                         error_rows.append({
+#                             "work_order_id": wo,
+#                             "error": f"No Default Warehouse for {ri.item_code}"
+#                         })
+#                         continue
+
+#                     src_wh = rig_doc.item_group_defaults[0].default_warehouse
+#                     if ri.source_warehouse != src_wh:
+#                         ri.source_warehouse = src_wh
+#                         changes_made = True
+
+#                 # ------------------- FINAL VALIDATION -------------------
+#                 if frappe.db.get_value("Warehouse", doc.fg_warehouse, "is_group"):
+#                     error_rows.append({
+#                         "work_order_id": wo,
+#                         "error": f"{doc.fg_warehouse} is a group warehouse"
+#                     })
+#                     continue
+
+#                 # ------------------- SAVE IF MODIFIED -------------------
+#                 if changes_made:
+#                     doc.save()
+
+#                 # ------------------- SUBMIT -------------------
+#                 if doc.docstatus == 0:
+#                     try:
+#                         doc.submit()
+#                         success_rows.append({
+#                             "work_order_id": wo,
+#                             "status": "Submitted"
+#                         })
+
+#                         # ------------------- AFTER WO SUBMIT -------------------
+#                         job_cards_map = {}
+
+#                         job_cards = frappe.get_all(
+#                             "Job Card",
+#                             filters={"work_order": doc.name},
+#                             fields=["name", "operation","for_quantity", "sequence_id"]
+#                         )
+
+#                         for jc in job_cards:
+#                             job_cards_map[jc.operation] = {
+#                                 "job_card": jc.name,
+#                                 "for_quantity": jc.for_quantity or 0,
+#                                 "sequence_id":jc.sequence_id
+#                             }
+
+#                         # ------------------- COLLECT NEW CHILD ROWS -------------------
+#                         for op in doc.operations or []:
+#                             key = (doc.name, op.operation)
+#                             if key in existing_ops:
+#                                 continue
+
+#                             job_card_info = job_cards_map.get(op.operation)
+
+#                             if not job_card_info:
+#                                 frappe.log_error(
+#                                     'Bulk Production Operation',f"Job Card not found for WO {doc.name}, Operation {op.operation}"
+#                                 )
+
+#                             job_card_id = job_card_info["job_card"]
+#                             for_quantity = job_card_info["for_quantity"]
+#                             sequence_id = job_card_info["sequence_id"]
+
+#                             if not job_card_id:
+#                                 # This should NEVER happen, but guard anyway
+#                                 frappe.log_error(
+#                                     'Bulk Production Operation',f"Job Card not found for WO {doc.name}, Operation {op.operation}"
+#                                 )
+#                                 continue
+
+#                             new_rows.append({
+#                                 "work_order_id": doc.name,
+#                                 "item_name": doc.production_item,
+#                                 "sales_order": sales_order,
+#                                 "production_plan": production_plan,
+#                                 "job_card": job_card_id, 
+#                                 "sequence_id":sequence_id,
+#                                 "remaining_qty": for_quantity,
+#                                 "operation": op.operation,
+#                                 "status": doc.status
+#                             })
+
+#                             existing_ops.add(key)
+
+#                     except Exception as e:
+#                         error_rows.append({
+#                             "work_order_id": wo,
+#                             "error": str(e)
+#                         })
+#                         continue
+
+#                 # ------------------- UPDATED ROWS -------------------
+#                 updated_rows.append({
+#                     "work_order_id": wo,
+#                     "status": doc.status,
+#                     "qty": doc.qty,
+#                     "produced_qty": doc.produced_qty,
+#                     "fg_warehouse": doc.fg_warehouse
+#                 })
+
+#             except Exception as e:
+#                 error_rows.append({
+#                     "work_order_id": wo,
+#                     "error": str(e)
+#                 })
+#                 frappe.log_error(frappe.get_traceback(), f"WO Failed: {wo}")
+
+#         # ==========================================================
+#         # 🔥 IDX SHIFT + INSERT AT TOP (SERVER-SIDE CORRECT WAY)
+#         # ==========================================================
+
+#         shift_by = len(new_rows)
+
+#         if shift_by:
+#             # Shift existing rows down
+#             for r in bulk_ops_doc.work_order_list:
+#                 r.idx = (r.idx or 0) + shift_by
+
+#             # Insert new rows at top
+#             idx = 1
+#             for data in new_rows:
+#                 r = bulk_ops_doc.append("work_order_list", {})
+#                 r.update(data)
+#                 r.idx = idx
+#                 idx += 1
+
+#             # Normalize idx
+#             bulk_ops_doc.work_order_list.sort(key=lambda r: r.idx or 0)
+#             for i, r in enumerate(bulk_ops_doc.work_order_list, start=1):
+#                 r.idx = i
+
+#             bulk_ops_doc.save(ignore_permissions=True)
+
+#         return {
+#             "status": "success",
+#             "success_rows": success_rows,
+#             "error_rows": error_rows,
+#             "updated_rows": updated_rows
+#         }
+
+#     finally:
+#         frappe.msgprint = original_msgprint
+
 @frappe.whitelist()
 def wo_validations(wo_ids, include_operations=0):
+
     if isinstance(wo_ids, str):
         wo_ids = json.loads(wo_ids)
 
-    success_rows = []  
-    error_rows = []     
-    updated_rows = []   
+    success_rows = []
+    error_rows = []
+    updated_rows = []
 
     original_msgprint = frappe.msgprint
     frappe.msgprint = lambda *args, **kwargs: None
 
     try:
-        for wo in wo_ids:
+        for row in wo_ids:
+
+            wo = row.get("work_order_id")
+            sales_order = row.get("sales_order")
+            production_plan = row.get("production_plan")
+
             if not wo:
                 continue
 
             try:
+
                 doc = frappe.get_doc("Work Order", wo)
                 changes_made = False
 
+                # ---------------- SETTINGS ----------------
+                include_operations = frappe.db.get_single_value(
+                    "Bulk Production Settings",
+                    "include_operations"
+                )
 
-                include_operations = frappe.db.get_single_value("Bulk Production Settings", "include_operations")
-                if include_operations == 0:
-                # REMOVE all operations before submit
-                    if doc.operations:
-                        doc.operations = []
-                        changes_made = True
-                
-                # 1️.  OPERATION DEFAULTS (ONLY IF include_operations == 1)
+                if include_operations == 0 and doc.operations:
+                    doc.operations = []
+                    changes_made = True
+
+                # ---------------- OPERATION DEFAULTS ----------------
                 if include_operations == 1:
                     for op in doc.operations or []:
 
-                        # Default time
-                        if not op.time_in_mins or op.time_in_mins == 0:
+                        if not op.time_in_mins:
                             default_time = frappe.db.get_value(
-                                "Operation", op.operation, "custom_default_time"
+                                "Operation",
+                                op.operation,
+                                "custom_default_time"
                             )
                             if default_time:
                                 op.time_in_mins = default_time
                                 changes_made = True
 
-                        # Default workstation
                         if not op.workstation:
-                            default_workstation = frappe.db.get_value(
-                                "Operation", op.operation, "workstation"
+                            default_ws = frappe.db.get_value(
+                                "Operation",
+                                op.operation,
+                                "workstation"
                             )
-                            if default_workstation:
-                                op.workstation = default_workstation
+                            if default_ws:
+                                op.workstation = default_ws
                                 changes_made = True
 
+                # ---------------- FG WAREHOUSE ----------------
+                if doc.production_item:
 
-                # ------------------- STEP 1️⃣: FG WAREHOUSE FROM ITEM GROUP -------------------
-                production_item = doc.production_item
-                if production_item:
-                    item_group = frappe.db.get_value("Item", production_item, "item_group")
-                    if item_group:
-                        ig_doc = frappe.get_doc("Item Group", item_group)
-                        
-                        # ❗ No defaults rows at all
-                        if not ig_doc.item_group_defaults or len(ig_doc.item_group_defaults) == 0:
-                            error_rows.append({
-                                "work_order_id": wo,
-                                "error": f"Item Group '{item_group}' has no Default Warehouse set for Production Item '{production_item}'"
-                            })
-                            continue  # 🔥 Skip this WO completely
+                    item_group = frappe.db.get_value(
+                        "Item",
+                        doc.production_item,
+                        "item_group"
+                    )
 
-                        # Row exists → extract default warehouse
-                        default_fg_wh = ig_doc.item_group_defaults[0].default_warehouse
+                    ig_doc = frappe.get_doc("Item Group", item_group)
 
-                        # ❗ First row exists but warehouse value missing/null/empty
-                        if not default_fg_wh:
-                            error_rows.append({
-                                "work_order_id": wo,
-                                "error": f"Item Group '{item_group}' Default Warehouse missing for Production Item '{production_item}'"
-                            })
-                            continue  # 🔥 Skip this WO completely
+                    if not ig_doc.item_group_defaults:
+                        error_rows.append({
+                            "work_order_id": wo,
+                            "error": f"No Default Warehouse in Item Group {item_group}"
+                        })
+                        continue
 
-                        # ✔ Assign if all checks passed
-                        if doc.fg_warehouse != default_fg_wh:
-                            doc.fg_warehouse = default_fg_wh
-                            changes_made = True
+                    fg_wh = ig_doc.item_group_defaults[0].default_warehouse
 
-                # ------------------- STEP 2️⃣: REQUIRED ITEMS DEFAULT WAREHOUSE -------------------
+                    if not fg_wh:
+                        error_rows.append({
+                            "work_order_id": wo,
+                            "error": f"FG Warehouse missing in Item Group {item_group}"
+                        })
+                        continue
+
+                    if doc.fg_warehouse != fg_wh:
+                        doc.fg_warehouse = fg_wh
+                        changes_made = True
+
+                # ---------------- REQUIRED ITEMS ----------------
                 for ri in doc.required_items or []:
-                    # if not ri.source_warehouse:
-                    ri_item_group = frappe.db.get_value("Item", ri.item_code, "item_group")
-                    if ri_item_group:
-                        rig_doc = frappe.get_doc("Item Group", ri_item_group)
-                        
-                        # ❗ if NO defaults row → fail this Work Order immediately
-                        if not rig_doc.item_group_defaults or len(rig_doc.item_group_defaults) == 0:
-                            error_rows.append({
-                                "work_order_id": wo,
-                                "error": f"Item Group '{ri_item_group}' has no Default Warehouse set for item '{ri.item_code}'"
-                            })
-                            # Stop processing this WO right here
-                            continue
 
-                        # ✔ default exists → assign warehouse
-                        ri_default_wh = rig_doc.item_group_defaults[0].default_warehouse
-                        if not ri_default_wh:
-                            error_rows.append({
-                                "work_order_id": wo,
-                                "error": f"Default Warehouse missing in Item Group '{ri_item_group}' for item '{ri.item_code}'"
-                            })
-                            break
+                    rig = frappe.db.get_value(
+                        "Item",
+                        ri.item_code,
+                        "item_group"
+                    )
 
-                        # ✔ assign default if all OK
-                        if ri.source_warehouse != ri_default_wh:
-                            ri.source_warehouse = ri_default_wh
-                            changes_made = True 
-                
-                # ------------------- FINAL VALIDATION BEFORE SUBMIT -------------------
-                validation_error = None
+                    rig_doc = frappe.get_doc("Item Group", rig)
 
-                # Check FG Warehouse
-                if not doc.fg_warehouse:
-                    validation_error = "Default Warehouse not found in item group defaults."
+                    if not rig_doc.item_group_defaults:
+                        error_rows.append({
+                            "work_order_id": wo,
+                            "error": f"No Default Warehouse for {ri.item_code}"
+                        })
+                        continue
 
-                else:
-                    # FG warehouse must not be a group warehouse
-                    is_group = frappe.db.get_value("Warehouse", doc.fg_warehouse, "is_group")
-                    if is_group:
-                        # doc.fg_warehouse = frappe.db.get_single_value("Bulk Production Settings","source_warehouse") #For now keeping a fallback but should not happen
-                        validation_error = f" '{doc.fg_warehouse}' is a group warehouse."
+                    src_wh = rig_doc.item_group_defaults[0].default_warehouse
 
-                # Check required_items warehouse
-                for ri in doc.required_items or []:
-                    if not ri.source_warehouse:
-                        validation_error = f"Source Warehouse missing: {ri.item_code}"
-                        break
+                    if ri.source_warehouse != src_wh:
+                        ri.source_warehouse = src_wh
+                        changes_made = True
 
-                    item_wh_group = frappe.db.get_value("Warehouse", ri.source_warehouse, "is_group")
-                    if item_wh_group:
-                        validation_error = (
-                            f"For item {ri.item_code},'{ri.source_warehouse}' is a group warehouse "
-                        )
-                        break
-
-                if validation_error:
+                # ---------------- FINAL VALIDATION ----------------
+                if frappe.db.get_value(
+                    "Warehouse",
+                    doc.fg_warehouse,
+                    "is_group"
+                ):
                     error_rows.append({
                         "work_order_id": wo,
-                        "error": validation_error
+                        "error": f"{doc.fg_warehouse} is a group warehouse"
                     })
-                    continue  # <--- IMPORTANT: skip further processing for this WO
+                    continue
 
-
-                # ------------------- SAVE IF MODIFIED -------------------
+                # ---------------- SAVE IF MODIFIED ----------------
                 if changes_made:
                     doc.save()
 
-                # ------------------- SUBMIT -------------------
+                # ---------------- SUBMIT ----------------
                 if doc.docstatus == 0:
                     try:
                         doc.submit()
+
                         success_rows.append({
                             "work_order_id": wo,
                             "status": "Submitted"
                         })
+
                     except Exception as e:
+
                         error_rows.append({
                             "work_order_id": wo,
                             "error": str(e)
                         })
-                        continue  # don't include in updated_rows refresh
+                        continue
 
-                # ------------------- ALWAYS APPEND TO UPDATED DATA -------------------
+                # ---------------- UPDATED ROWS ----------------
                 updated_rows.append({
                     "work_order_id": wo,
                     "status": doc.status,
@@ -605,13 +853,17 @@ def wo_validations(wo_ids, include_operations=0):
                 })
 
             except Exception as e:
+
                 error_rows.append({
                     "work_order_id": wo,
                     "error": str(e)
                 })
-                frappe.log_error(frappe.get_traceback(), f"WO Processing Failed: {wo}")
 
-        # --------------- FINAL RESPONSE FOR UI ----------------
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    f"WO Failed: {wo}"
+                )
+
         return {
             "status": "success",
             "success_rows": success_rows,
@@ -622,6 +874,26 @@ def wo_validations(wo_ids, include_operations=0):
     finally:
         frappe.msgprint = original_msgprint
 
+def is_work_order_operations_completed(work_order_id):
+
+    wo = frappe.get_doc("Work Order", work_order_id)
+    wo_qty = wo.qty
+
+    completed = frappe.db.sql("""
+        SELECT operation, SUM(total_completed_qty) as total
+        FROM `tabJob Card`
+        WHERE work_order = %s
+          AND docstatus = 1
+        GROUP BY operation
+    """, work_order_id, as_dict=True)
+
+    completed_map = {r.operation: r.total for r in completed}
+
+    for op in wo.operations:
+        if completed_map.get(op.operation, 0) < wo_qty:
+            return False
+
+    return True
 
 @frappe.whitelist()
 def validate_start_batch(rows=None):
@@ -635,6 +907,9 @@ def validate_start_batch(rows=None):
     for r in rows:
         wo_id = r.get("work_order_id")
         inventory_check = r.get("inventory_check")
+        ops_included = r.get("operations_included")
+        ops_completed = r.get("operations_completed")
+        status = r.get("status")
 
         if not wo_id:
             result.append({
@@ -644,6 +919,25 @@ def validate_start_batch(rows=None):
                 "reason": "Work Order Missing"
             })
             continue
+
+        # if ops_included and not ops_completed:
+        #     result.append({
+        #         "work_order_id": wo_id,
+        #         "status": "Cannot Proceed",
+        #         "can_process": False,
+        #         "reason": "Operations not completed"
+        #     })
+        #     continue
+
+        # is_ops_completed = is_work_order_operations_completed(wo_id)
+        # if ops_included and not is_ops_completed:
+        #     result.append({
+        #         "work_order_id": wo_id,
+        #         "status": "Cannot Proceed",
+        #         "can_process": False,
+        #         "reason": "Operations not completed"
+        #     })
+        #     continue
 
         wo = frappe.get_doc("Work Order", wo_id)
 
@@ -656,9 +950,13 @@ def validate_start_batch(rows=None):
             reason = f"Material not ready ({inventory_check})"
 
         # 🔥 Work order status validation
-        if wo.status not in ["Not Started", "Draft"]:
+        if wo.status == "Draft":
             can_process = False
-            reason = f"Work Order already started ({wo.status})"
+            reason = f"Work Order Not Submmitted"
+
+        if wo.status == "In Process":
+            can_process = False
+            reason = f"Work Order already In Process"
 
         if can_process:
             processable_count += 1
@@ -679,6 +977,122 @@ def validate_start_batch(rows=None):
         "rows": result
     }
 
+# @frappe.whitelist()
+# def start_work_orders(wo_ids):
+
+#     if isinstance(wo_ids, str):
+#         wo_ids = json.loads(wo_ids)
+
+#     updated_rows = []
+#     failed_rows = []
+
+#     try:
+#         for wo_id in wo_ids:
+#             if not wo_id:
+#                 continue
+
+#             try:
+#                 # 1️⃣ CHECK IF SE ALREADY EXISTS
+#                 existing_se = frappe.db.exists(
+#                     "Stock Entry",
+#                     {
+#                         "work_order": wo_id,
+#                         "purpose": "Material Transfer for Manufacture",
+#                         "docstatus": 1
+#                     }
+#                 )
+#                 if existing_se:
+#                     failed_rows.append({
+#                         "work_order_id": wo_id,
+#                         "error": f"Stock Entry already exists ({existing_se})"
+#                     })
+#                     continue
+
+#                 # 2️⃣ VALIDATE MATERIAL FROM REQUIRED WAREHOUSE
+#                 wo_doc = frappe.get_doc("Work Order", wo_id)
+#                 insufficient_items = []
+
+#                 for item in wo_doc.required_items:
+#                     wh = item.source_warehouse
+#                     if not wh:
+#                         insufficient_items.append(f"{item.item_code} (Warehouse missing)")
+#                         continue
+
+#                     qty_available = frappe.db.get_value(
+#                         "Bin",
+#                         {"item_code": item.item_code, "warehouse": wh},
+#                         "actual_qty"
+#                     ) or 0
+
+#                     if qty_available < item.required_qty:
+#                         insufficient_items.append(
+#                             f"{item.item_code}: Need {item.required_qty}, Have {qty_available}"
+#                         )
+
+#                 if insufficient_items:
+#                     failed_rows.append({
+#                         "work_order_id": wo_id,
+#                         "error": "Insufficient Stock → " + ", ".join(insufficient_items)
+#                     })
+#                     continue
+
+#                 # 3️⃣ MAKE STOCK ENTRY
+#                 qty = wo_doc.qty
+#                 se_response = frappe.call(
+#                     "erpnext.manufacturing.doctype.work_order.work_order.make_stock_entry",
+#                     work_order_id=wo_id,
+#                     purpose="Material Transfer for Manufacture",
+#                     qty=qty
+#                 )
+#                 # frappe.log_error("SE Response for Starting Work Orders", json.dumps(se_response))
+#                 if not se_response:
+#                     failed_rows.append({
+#                         "work_order_id": wo_id,
+#                         "error": "Failed generating Stock Entry"
+#                     })
+#                     continue
+
+#                 if isinstance(se_response, dict) and "message" in se_response:
+#                     se_response = se_response["message"]
+
+#                 if isinstance(se_response, dict):
+#                     se_doc = frappe.get_doc(se_response)
+#                 else:
+#                     se_doc = se_response
+
+#                 se_doc.flags.ignore_permissions = True
+#                 se_doc.insert()
+#                 se_doc.submit()
+
+#                 # frappe.log_error( "SE Submitted", f"Stock Entry {se_doc.name} submitted for WO {wo_doc.status}")
+
+#                 updated_rows.append({
+#                     "work_order_id": wo_id,
+#                     "status": "In Process",
+#                     "produced_qty": wo_doc.produced_qty or 0
+#                 })
+
+#             except Exception as err:
+#                 failed_rows.append({
+#                     "work_order_id": wo_id,
+#                     "error": str(err)
+#                 })
+#                 continue
+
+#         frappe.db.commit()
+
+#         return {
+#             "status": "partial" if failed_rows else "success",
+#             "updated_rows": updated_rows,
+#             "failed_rows": failed_rows,
+#             "message": f"{len(updated_rows)} done, {len(failed_rows)} failed"
+#         }
+
+#     except Exception as e:
+#         frappe.db.rollback()
+#         frappe.log_error(frappe.get_traceback(), "start_work_orders ERROR")
+#         return {"status": "error", "message": str(e)}
+
 @frappe.whitelist()
 def start_work_orders(wo_ids):
 
@@ -689,12 +1103,24 @@ def start_work_orders(wo_ids):
     failed_rows = []
 
     try:
+
+        bulk_ops_doc = frappe.get_single("Bulk Production Operation")
+
+        existing_ops = set(
+            (r.work_order_id, r.operation)
+            for r in bulk_ops_doc.work_order_list or []
+        )
+
+        new_rows = []
+
         for wo_id in wo_ids:
+
             if not wo_id:
                 continue
 
             try:
-                # 1️⃣ CHECK IF SE ALREADY EXISTS
+
+                # 1️⃣ CHECK EXISTING SE
                 existing_se = frappe.db.exists(
                     "Stock Entry",
                     {
@@ -703,6 +1129,7 @@ def start_work_orders(wo_ids):
                         "docstatus": 1
                     }
                 )
+
                 if existing_se:
                     failed_rows.append({
                         "work_order_id": wo_id,
@@ -710,19 +1137,52 @@ def start_work_orders(wo_ids):
                     })
                     continue
 
-                # 2️⃣ VALIDATE MATERIAL FROM REQUIRED WAREHOUSE
+                # 2️⃣ VALIDATE MATERIAL
                 wo_doc = frappe.get_doc("Work Order", wo_id)
+                sales_order = None
+                production_plan = None
+
+                # get latest Bulk Production record
+                latest_bulk = frappe.get_all(
+                    "Bulk Production",
+                    fields=["name"],
+                    order_by="creation desc",
+                    limit=1
+                )
+
+                if latest_bulk:
+
+                    bulk_doc = frappe.get_doc("Bulk Production", latest_bulk[0].name)
+                    row = frappe.db.get_value(
+                        "Work Order List",   # child table doctype
+                        {
+                            "parent": bulk_doc.name,
+                            "work_order_id": wo_doc.name
+                        },
+                        ["sales_order", "production_plan"],
+                        as_dict=True
+                    )
+
+                    sales_order = row.sales_order if row else None
+                    production_plan = row.production_plan if row else None
                 insufficient_items = []
 
                 for item in wo_doc.required_items:
+
                     wh = item.source_warehouse
+
                     if not wh:
-                        insufficient_items.append(f"{item.item_code} (Warehouse missing)")
+                        insufficient_items.append(
+                            f"{item.item_code} (Warehouse missing)"
+                        )
                         continue
 
                     qty_available = frappe.db.get_value(
                         "Bin",
-                        {"item_code": item.item_code, "warehouse": wh},
+                        {
+                            "item_code": item.item_code,
+                            "warehouse": wh
+                        },
                         "actual_qty"
                     ) or 0
 
@@ -740,13 +1200,14 @@ def start_work_orders(wo_ids):
 
                 # 3️⃣ MAKE STOCK ENTRY
                 qty = wo_doc.qty
+
                 se_response = frappe.call(
                     "erpnext.manufacturing.doctype.work_order.work_order.make_stock_entry",
                     work_order_id=wo_id,
                     purpose="Material Transfer for Manufacture",
                     qty=qty
                 )
-                # frappe.log_error("SE Response for Starting Work Orders", json.dumps(se_response))
+
                 if not se_response:
                     failed_rows.append({
                         "work_order_id": wo_id,
@@ -766,7 +1227,60 @@ def start_work_orders(wo_ids):
                 se_doc.insert()
                 se_doc.submit()
 
-                # frappe.log_error( "SE Submitted", f"Stock Entry {se_doc.name} submitted for WO {wo_doc.status}")
+                # ---------------- BULK PRODUCTION OPERATION CREATION ----------------
+
+                job_cards = frappe.get_all(
+                    "Job Card",
+                    filters={"work_order": wo_doc.name},
+                    fields=["name", "operation", "for_quantity", "sequence_id"]
+                )
+
+                job_cards_map = {jc.operation: jc for jc in job_cards}
+
+                for op in wo_doc.operations or []:
+
+                    key = (wo_doc.name, op.operation)
+
+                    if key in existing_ops:
+                        continue
+
+                    jc = job_cards_map.get(op.operation)
+
+                    # For Setting the unique id in the job card 
+                    jc_doc = frappe.get_doc("Job Card", jc.name)
+
+                    if not jc_doc.custom_unique_id:
+
+                        # operation_code = op.operation.replace(" ", "").upper()[:4]
+
+                        custom_unique_id = frappe.model.naming.make_autoname(
+                            f"PO-JOB-.MM.-.YY.-.#####"
+                        )
+
+                        jc_doc.custom_unique_id = custom_unique_id
+                        jc_doc.save(ignore_permissions=True)
+
+                    if not jc:
+                        frappe.log_error(
+                            f"Job Card not found for WO {wo_doc.name}, Operation {op.operation}",
+                            "Bulk Production Operation"
+                        )
+                        continue
+
+                    new_rows.append({
+                        "work_order_id": wo_doc.name,
+                        "item_name": wo_doc.production_item,
+                        "sales_order": sales_order,
+                        "production_plan": production_plan,
+                        "job_card": jc.name,
+                        "custom_unique_id": jc_doc.custom_unique_id,
+                        "sequence_id": jc.sequence_id,
+                        "remaining_qty": jc.for_quantity or 0,
+                        "operation": op.operation,
+                        "status": wo_doc.status
+                    })
+
+                    existing_ops.add(key)
 
                 updated_rows.append({
                     "work_order_id": wo_id,
@@ -775,11 +1289,42 @@ def start_work_orders(wo_ids):
                 })
 
             except Exception as err:
+
                 failed_rows.append({
                     "work_order_id": wo_id,
                     "error": str(err)
                 })
                 continue
+
+        # ---------------- INSERT ROWS AT TOP ----------------
+
+        shift_by = len(new_rows)
+
+        if shift_by:
+
+            for r in bulk_ops_doc.work_order_list:
+                r.idx = (r.idx or 0) + shift_by
+
+            idx = 1
+
+            for data in new_rows:
+
+                r = bulk_ops_doc.append("work_order_list", {})
+                r.update(data)
+                r.idx = idx
+                idx += 1
+
+            bulk_ops_doc.work_order_list.sort(
+                key=lambda r: r.idx or 0
+            )
+
+            for i, r in enumerate(
+                bulk_ops_doc.work_order_list,
+                start=1
+            ):
+                r.idx = i
+
+            bulk_ops_doc.save(ignore_permissions=True)
 
         frappe.db.commit()
 
@@ -791,9 +1336,18 @@ def start_work_orders(wo_ids):
         }
 
     except Exception as e:
+
         frappe.db.rollback()
-        frappe.log_error(frappe.get_traceback(), "start_work_orders ERROR")
-        return {"status": "error", "message": str(e)}
+
+        frappe.log_error(
+            frappe.get_traceback(),
+            "start_work_orders ERROR"
+        )
+
+        return {
+            "status": "error",
+            "message": str(e)
+        }
 
 @frappe.whitelist()
 def close_batch(docname=None, rows=None, company=None):
@@ -931,10 +1485,29 @@ def preview_close_batch(rows=None, company=None):
         manufactured_today = float(r.get("manufactured_today") or 0)
         balance_quantity = float(r.get("balance_quantity") or 0)
         status = r.get("status")
+        ops_included = r.get("ops_included")
+        ops_completed = r.get("ops_completed")
 
         # default decision
         can_process = True
         reason = ""
+
+
+        if ops_included and not ops_completed:
+            can_process = False
+            reason = "Operations not completed"
+
+            preview_rows.append({
+                "work_order_id": wo_id,
+                "manufactured_today": manufactured_today,
+                "balance_quantity": balance_quantity,
+                "closing_balance": balance_quantity,
+                "closing_status": status,
+                "status": "Cannot Proceed",
+                "can_process": False,
+                "reason": reason
+            })
+            continue   # ❌ stop here
 
         # Rule 1: Invalid Status -> Skip immediately, do NOT fetch Work Order
         if status != "In Process":
